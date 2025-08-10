@@ -1,5 +1,40 @@
 # miniintern
 
+척추 협착증 관련 ai 학습 및 개발
+
+
+## 시작
+
+import pandas as pd
+import ast
+
+# 엑셀에서 라벨/텍스트 로딩
+df = pd.read_excel("STEN_labeled_output.xlsx")
+
+# 문자열 dict → 실제 dict
+df["label_dict"] = df["auto_label"].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+
+# 멀티라벨 벡터 생성
+label_keys = ["L1/2", "L2/3", "L3/4", "L4/5", "L5/S1", "need_check"]
+df["label_vector"] = df["label_dict"].apply(lambda d: [int(d[k]) for k in label_keys])
+
+# 학습에 쓰는 컬럼
+df_model = df[["검사결과", "label_vector"]].rename(columns={"검사결과": "text"})
+
+# train/val/test 분할 및 저장
+from sklearn.model_selection import train_test_split
+
+train_val, test = train_test_split(df_model, test_size=0.1, random_state=42)
+train, val = train_test_split(train_val, test_size=0.1111, random_state=42)  # 0.1111 * 0.9 = 0.1
+
+print("Train:", len(train))
+print("Val:", len(val))
+print("Test:", len(test))
+
+train.to_json("train.jsonl", orient="records", lines=True, force_ascii=False)
+val.to_json("val.jsonl", orient="records", lines=True, force_ascii=False)
+test.to_json("test.jsonl", orient="records", lines=True, force_ascii=False)
+
 import os, re, pickle, numpy as np, pandas as pd, warnings, time
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
@@ -8,25 +43,30 @@ from sklearn.metrics import classification_report, precision_recall_fscore_suppo
 from scipy.sparse import hstack
 
 warnings.filterwarnings("ignore")
-os.environ["PYTHONUNBUFFERED"] = "1"  
+os.environ["PYTHONUNBUFFERED"] = "1"  # 로그 즉시 출력
 
 t0 = time.time()
 def log(m): print(m, flush=True)
 
+# =========================
 # Config
+# =========================
 SAVE_DIR = "./final_model"; os.makedirs(SAVE_DIR, exist_ok=True)
 MODEL_PATH = os.path.join(SAVE_DIR, "tfidf_ovr_model.pkl")
 THS_PATH   = os.path.join(SAVE_DIR, "best_ths.npy")
 CAL_A_PATH = os.path.join(SAVE_DIR, "platt_A.npy")   # per-class A
 CAL_B_PATH = os.path.join(SAVE_DIR, "platt_B.npy")   # per-class B
 
-LOAD_EXISTING = False   
+LOAD_EXISTING = False   # True면 저장된 아티팩트 로드 후 바로 추론/테스트
 
-GLOBAL_MIN_PREC = 0.70  
-FOCUS = {0: 0.80, 4: 0.80} 
-BETA   = 0.5            
+# 임계값 규칙
+GLOBAL_MIN_PREC = 0.70  # 기본 클래스 정밀도 하한
+FOCUS = {0: 0.80, 4: 0.80}  # ★ 클래스 0/4는 precision ≥ 0.80로 강화
+BETA   = 0.5            # F_beta (precision 쪽 가중↑)
 
+# =========================
 # Utils
+# =========================
 def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", str(s)).strip()
 
@@ -61,7 +101,7 @@ def pick_thresholds(y_true: np.ndarray, prob: np.ndarray,
       - F_beta 최대화 (beta<1이면 precision에 더 가중)
     """
     C = y_true.shape[1]
-    ths = np.full(C, 0.6, dtype=np.float32)  
+    ths = np.full(C, 0.6, dtype=np.float32)  # 못 찾으면 보수적으로 0.6
     grid = np.linspace(0.1, 0.9, 33)
     for c in range(C):
         min_prec = class_prec_floor.get(c, default_min_prec) if class_prec_floor else default_min_prec
@@ -95,8 +135,9 @@ def retune_class_threshold_by_f1(y_true, prob, ths, c, t_min=0.2, t_max=0.95, st
     log(f"  - class {c} threshold retuned → {best_t:.3f} (val F1={best_f:.4f})")
     return ths
 
+# =========================
 # Load Data
-
+# =========================
 log("[1/6] Loading data ...")
 df_tr = pd.read_json("train.jsonl", lines=True)
 df_va = pd.read_json("val.jsonl",   lines=True)
@@ -108,9 +149,9 @@ Y_tr = np.array(df_tr["label_vector"].tolist(), dtype=int)
 Y_va = np.array(df_va["label_vector"].tolist(), dtype=int)
 Y_te = np.array(df_te["label_vector"].tolist(), dtype=int)
 
-
+# =========================
 # Train or Load
-
+# =========================
 if not LOAD_EXISTING:
     log("[2/6] Vectorizing (word & char n-grams) ...")
     word_vec = TfidfVectorizer(analyzer="word", ngram_range=(1,2),
@@ -155,8 +196,9 @@ else:
     Xte_c = char_vec.transform(df_te["text"])
     X_te = hstack([Xte_w, Xte_c]).tocsr()
 
-# Per-class Platt calibration
-
+# =========================
+# Per-class Platt calibration + Thresholds (0/4 강화) + (옵션) 0/4 재튜닝
+# =========================
 if not LOAD_EXISTING:
     log("[4/6] Per-class Platt calibration on validation margins ...")
     # 마진(결정함수) 추출
@@ -178,10 +220,10 @@ if not LOAD_EXISTING:
         Y_va, P_va_cal,
         default_min_prec=GLOBAL_MIN_PREC,
         beta=BETA,
-        class_prec_floor=FOCUS   
+        class_prec_floor=FOCUS   # ★ 0/4 클래스 강화
     )
 
-    # 'F1 최댓값'으로 미세조정
+    # (선택) 0/4 F1만 더 올리려는 재튜닝
     for c in FOCUS.keys():
         ths = retune_class_threshold_by_f1(Y_va, P_va_cal, ths, c=c, t_min=0.2, t_max=0.95, steps=40)
 
@@ -195,9 +237,9 @@ else:
     A = np.load(CAL_A_PATH); B = np.load(CAL_B_PATH)
     log(f"[Loaded] thresholds & Platt params from {SAVE_DIR}")
 
-
+# =========================
 # Test
-
+# =========================
 log("[6/6] Testing ...")
 Z_te = clf.decision_function(X_te)
 P_te_cal = platt_apply(Z_te, A, B)
@@ -209,12 +251,11 @@ mi = f1_score(Y_te, preds, average="micro", zero_division=0)
 ma = precision_recall_fscore_support(Y_te, preds, average="macro", zero_division=0)[2]
 print({"micro_f1": round(mi,4), "macro_f1": round(ma,4)})
 
-
+# =========================
 # Summary
-
+# =========================
 log(f"\nArtifacts saved in: {os.path.abspath(SAVE_DIR)}")
 for p in (MODEL_PATH, THS_PATH, CAL_A_PATH, CAL_B_PATH):
     log(f" - {p} ({'exists' if os.path.exists(p) else 'missing'})")
 
 print(f"\nDone in {int(time.time()-t0)} sec.", flush=True)
-
