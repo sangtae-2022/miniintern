@@ -3,19 +3,78 @@
 
 # 데이터 정제
 ```python
+import os
 import pandas as pd
-import ast
+import matplotlib.pyplot as plt
 
-df = pd.read_excel("STEN_labeled_output.xlsx")
+RAW_CANDIDATES = ["labels_from_report.csv", "labels_from_report.xlsx"]
+REFINED_PATH   = "refined_labels.csv"
 
-df["label_dict"] = df["auto_label"].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+def find_first(paths):
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return None
 
-label_keys = ["L1/2", "L2/3", "L3/4", "L4/5", "L5/S1", "need_check"]
-df["label_vector"] = df["label_dict"].apply(lambda d: [int(d[k]) for k in label_keys])
+def to_bool(s, default=True):
+    if not isinstance(s, (pd.Series, pd.Index)):
+        s = pd.Series(s)
+    s = s.replace({"True": True, "False": False, 1: True, 0: False})
+    return s.astype(object).fillna(default).astype(bool)
 
-df_model = df[["검사결과", "label_vector"]].rename(columns={"검사결과": "text"})
+def main():
+    raw_path = find_first(RAW_CANDIDATES)
+    if raw_path is None:
+        raise FileNotFoundError("labels_from_report.csv(.xlsx) 파일을 같은 폴더에 두세요.")
+    if not os.path.exists(REFINED_PATH):
+        raise FileNotFoundError("refined_labels.csv 파일이 없습니다.")
 
-df_model.head()
+    raw = pd.read_excel(raw_path) if raw_path.lower().endswith(".xlsx") else pd.read_csv(raw_path)
+    ref = pd.read_csv(REFINED_PATH)
+
+    if "row_idx" not in raw.columns:
+        raw = raw.reset_index(drop=True).reset_index().rename(columns={"index":"row_idx"})
+    if "row_idx" not in ref.columns:
+        ref = ref.reset_index(drop=True).reset_index().rename(columns={"index":"row_idx"})
+
+    if "need_check" not in raw.columns:
+        raw["need_check"] = True
+    raw["need_check"] = to_bool(raw["need_check"])
+
+    if "need_check_before" not in ref.columns:
+        ref = ref.merge(
+            raw[["row_idx", "need_check"]].rename(columns={"need_check":"need_check_before"}),
+            on="row_idx", how="left"
+        )
+    ref["need_check_before"] = to_bool(ref["need_check_before"])
+    ref["need_check"] = to_bool(ref["need_check"]) if "need_check" in ref.columns else ref["need_check_before"].copy()
+
+    before = ref["need_check_before"]
+    after_raw = ref["need_check"]
+    after_fixed = before & after_raw
+    ref["need_check_fixed"] = after_fixed
+
+    n = len(ref)
+    before_true = int(before.sum())
+    after_fix_true = int(after_fixed.sum())
+    after_fix_false = n - after_fix_true
+
+    plt.figure()
+    plt.bar(["Before(True)", "After_fixed(True)"], [before_true, after_fix_true])
+    plt.title("Need check true before after_fixed")
+    plt.ylabel("Count")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure()
+    plt.pie([after_fix_true, after_fix_false],
+            labels=["True", "False"], autopct="%.1f%%", startangle=90)
+    plt.title("True vs False")
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    main()
 ```
 
 # 데이터 분할
@@ -39,172 +98,351 @@ test.to_json("test.jsonl", orient="records", lines=True, force_ascii=False)
 # 학습 모델 코드
 
 ```python
-import os, re, pickle, numpy as np, pandas as pd, warnings, time, ast
+import os, json, re, time, pickle
+import numpy as np, pandas as pd
+from scipy.sparse import hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.multiclass import OneVsRestClassifier
-from sklearn.metrics import classification_report, precision_recall_fscore_support, f1_score
 from sklearn.model_selection import train_test_split
-from scipy.sparse import hstack
+from sklearn.metrics import (
+    classification_report,
+    precision_recall_fscore_support,
+    f1_score,
+)
 
-warnings.filterwarnings("ignore")
-os.environ["PYTHONUNBUFFERED"] = "1"
+ARTI_DIR   = "artifacts"          
+CONFIRM_CSV= os.path.join(ARTI_DIR, "confirmed_dataset.csv")
+META_JSON  = os.path.join(ARTI_DIR, "meta.json")
+SAVE_DIR   = "final_model"; os.makedirs(SAVE_DIR, exist_ok=True)
 
-t0 = time.time()
-def log(m): print(m, flush=True)
+MODEL_PATH = os.path.join(SAVE_DIR, "tfidf_ovr_model.pkl")
+A_PATH     = os.path.join(SAVE_DIR, "platt_A.npy")
+B_PATH     = os.path.join(SAVE_DIR, "platt_B.npy")
+THS_PATH   = os.path.join(SAVE_DIR, "best_ths.npy")
 
-def _clean(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s)).strip()
+SEED = 42
+MAXF_WORD = 120_000
+MAXF_CHAR = 80_000
+MAX_ITER  = 800
+C_PARAM   = 3.0
 
-def sigmoid(x):
-    x = np.clip(x, -50, 50)
-    return 1 / (1 + np.exp(-x))
+DEFAULT_PREC_FLOOR = 0.70           
+CLASS_PREC_FLOOR   = {}             
+BETA = 0.5                         
 
-def platt_fit_1d(z, y):
-    z = z.reshape(-1, 1)
+
+def _clean(s): return re.sub(r"\s+", " ", str(s or "")).strip()
+def _sigmoid(x): x=np.clip(x,-50,50); return 1/(1+np.exp(-x))
+
+def _platt_fit_1d(z, y):
+    """z: (n,) decision margin, y: {0,1}"""
+    z = z.reshape(-1,1)
     lr = LogisticRegression(solver="lbfgs", C=1.0, max_iter=200, class_weight="balanced")
     lr.fit(z, y)
-    A = float(lr.coef_[0, 0]); B = float(lr.intercept_[0])
-    return A, B
+    return float(lr.coef_[0,0]), float(lr.intercept_[0])
 
-def platt_apply(Z, A, B):
-    return sigmoid(Z * A + B)
+def _platt_apply(Z, A, B):
+  
+    return _sigmoid(Z*A + B)
 
-def pick_thresholds(y_true: np.ndarray, prob: np.ndarray, default_min_prec: float, beta: float, class_prec_floor: dict | None = None) -> np.ndarray:
+def _pick_thresholds(y_true, prob, default_min_prec, beta=1.0, class_prec_floor=None):
     C = y_true.shape[1]
-    ths = np.full(C, 0.6, dtype=np.float32)
-    grid = np.linspace(0.1, 0.9, 33)
+    ths = np.full(C, 0.5, dtype=np.float32)
+    grid = np.linspace(0.1, 0.95, 57)
     for c in range(C):
-        min_prec = class_prec_floor.get(c, default_min_prec) if class_prec_floor else default_min_prec
-        best, bt = -1.0, 0.6
+        floor = (class_prec_floor or {}).get(c, default_min_prec)
+        best, best_t = -1.0, 0.5
         for t in grid:
-            pred = (prob[:, c] >= t).astype(int)
-            prec, rec, _, _ = precision_recall_fscore_support(y_true[:, c], pred, average="binary", zero_division=0)
-            if prec < min_prec: continue
-            b2 = beta * beta
-            fbeta = (1 + b2) * prec * rec / (b2 * prec + rec + 1e-12)
+            pred = (prob[:,c] >= t).astype(int)
+            prec, rec, _, _ = precision_recall_fscore_support(y_true[:,c], pred, average="binary", zero_division=0)
+            if floor is not None and prec < floor:  
+                continue
+            b2 = beta*beta
+            fbeta = (1+b2)*prec*rec/(b2*prec+rec+1e-12)
             if fbeta > best:
-                best, bt = fbeta, t
-        ths[c] = bt
+                best, best_t = fbeta, t
+        ths[c] = best_t
     return ths
 
-def retune_class_threshold_by_f1(y_true, prob, ths, c, t_min=0.2, t_max=0.95, steps=40):
-    grid = np.linspace(t_min, t_max, steps)
-    best_t, best_f = ths[c], -1.0
-    for t in grid:
-        pred = (prob[:, c] >= t).astype(int)
-        prec, rec, f1, _ = precision_recall_fscore_support(y_true[:, c], pred, average="binary", zero_division=0)
-        if f1 > best_f:
-            best_f, best_t = f1, t
-    ths[c] = best_t
-    log(f"  - class {c} threshold retuned → {best_t:.3f} (val F1={best_f:.4f})")
-    return ths
+def main():
+    t0 = time.time()
+    if not os.path.exists(CONFIRM_CSV) or not os.path.exists(META_JSON):
+        raise FileNotFoundError("artifacts/confirmed_dataset.csv 또는 artifacts/meta.json 이 없습니다. 먼저 전처리를 실행하세요.")
 
-df = pd.read_excel("STEN_labeled_output.xlsx")
-df["label_dict"] = df["auto_label"].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
-label_keys = ["L1/2", "L2/3", "L3/4", "L4/5", "L5/S1", "need_check"]
-df["label_vector"] = df["label_dict"].apply(lambda d: [int(d[k]) for k in label_keys])
-df_model = df[["검사결과", "label_vector"]].rename(columns={"검사결과": "text"})
-train_val, test = train_test_split(df_model, test_size=0.1, random_state=42)
-train, val = train_test_split(train_val, test_size=0.1111, random_state=42)
-print("Train:", len(train)); print("Val:", len(val)); print("Test:", len(test))
-train.to_json("train.jsonl", orient="records", lines=True, force_ascii=False)
-val.to_json("val.jsonl", orient="records", lines=True, force_ascii=False)
-test.to_json("test.jsonl", orient="records", lines=True, force_ascii=False)
+    meta = json.load(open(META_JSON, "r", encoding="utf-8"))
+    text_col = meta.get("text_col") or "text"
+    levels   = meta.get("levels")
+    if not levels:
 
-SAVE_DIR = "./final_model"; os.makedirs(SAVE_DIR, exist_ok=True)
-MODEL_PATH = os.path.join(SAVE_DIR, "tfidf_ovr_model.pkl")
-THS_PATH   = os.path.join(SAVE_DIR, "best_ths.npy")
-CAL_A_PATH = os.path.join(SAVE_DIR, "platt_A.npy")
-CAL_B_PATH = os.path.join(SAVE_DIR, "platt_B.npy")
-LOAD_EXISTING = False
-GLOBAL_MIN_PREC = 0.70
-FOCUS = {0: 0.80, 4: 0.80}
-BETA = 0.5
+        sample = pd.read_csv(CONFIRM_CSV, nrows=5)
+        levels = [c for c in sample.columns if str(c).startswith("L")]
+        if not levels:
+            raise ValueError("라벨 컬럼(levels)을 찾을 수 없습니다.")
 
-log("[1/6] Loading data ...")
-df_tr = pd.read_json("train.jsonl", lines=True)
-df_va = pd.read_json("val.jsonl",   lines=True)
-df_te = pd.read_json("test.jsonl",  lines=True)
-for d in (df_tr, df_va, df_te):
-    d["text"] = d["text"].map(_clean)
-Y_tr = np.array(df_tr["label_vector"].tolist(), dtype=int)
-Y_va = np.array(df_va["label_vector"].tolist(), dtype=int)
-Y_te = np.array(df_te["label_vector"].tolist(), dtype=int)
+    df = pd.read_csv(CONFIRM_CSV)
+    if "need_check_fixed" not in df.columns:
+        raise ValueError("confirmed_dataset.csv 에 need_check_fixed가 없습니다.")
+    df = df[df["need_check_fixed"]==False].copy().reset_index(drop=True) 
+    df[text_col] = df[text_col].map(_clean)
 
-if not LOAD_EXISTING:
-    log("[2/6] Vectorizing (word & char n-grams) ...")
-    word_vec = TfidfVectorizer(analyzer="word", ngram_range=(1,2), min_df=3, max_df=0.9, max_features=200_000, sublinear_tf=True, norm="l2")
-    char_vec = TfidfVectorizer(analyzer="char", ngram_range=(2,5), min_df=3, max_df=1.0, max_features=200_000, sublinear_tf=True, norm="l2")
-    Xtr_w = word_vec.fit_transform(df_tr["text"])
-    Xva_w = word_vec.transform(df_va["text"])
-    Xte_w = word_vec.transform(df_te["text"])
-    Xtr_c = char_vec.fit_transform(df_tr["text"])
-    Xva_c = char_vec.transform(df_va["text"])
-    Xte_c = char_vec.transform(df_te["text"])
-    X_tr = hstack([Xtr_w, Xtr_c]).tocsr()
-    X_va = hstack([Xva_w, Xva_c]).tocsr()
-    X_te = hstack([Xte_w, Xte_c]).tocsr()
-    log(f"    done. shapes: train={X_tr.shape}, val={X_va.shape}, test={X_te.shape}")
-    log("[3/6] Training OvR(LogReg, saga) ...")
-    base_lr = LogisticRegression(solver="saga", penalty="l2", C=4.0, max_iter=2000, class_weight="balanced", n_jobs=-1, verbose=1)
-    clf = OneVsRestClassifier(base_lr, n_jobs=None)
-    clf.fit(X_tr, Y_tr)
-    with open(MODEL_PATH, "wb") as f:
-        pickle.dump({"word_vec": word_vec, "char_vec": char_vec, "model": clf}, f)
-    log(f"[Saved model] {MODEL_PATH}")
-else:
-    log("[2/6] Loading saved model/vectorizers ...")
-    with open(MODEL_PATH, "rb") as f:
-        data = pickle.load(f)
-    word_vec, char_vec, clf = data["word_vec"], data["char_vec"], data["model"]
-    Xte_w = word_vec.transform(df_te["text"])
-    Xte_c = char_vec.transform(df_te["text"])
-    X_te = hstack([Xte_w, Xte_c]).tocsr()
-    X_va = None
+    for lv in levels: df[lv] = df[lv].fillna(0).astype(int)
+    Y = df[levels].astype(int).values
+    X_text = df[text_col].astype(str)
 
-if not LOAD_EXISTING:
-    log("[4/6] Per-class Platt calibration on validation margins ...")
-    Z_va = clf.decision_function(X_va)
+    X_tr, X_va, y_tr, y_va = train_test_split(
+        X_text, Y, test_size=0.1, random_state=SEED, stratify=Y.sum(axis=1)
+    )
+
+    word_vec = TfidfVectorizer(analyzer="word", ngram_range=(1,2),
+                               min_df=3, max_df=0.95, max_features=MAXF_WORD,
+                               sublinear_tf=True, norm="l2")
+    char_vec = TfidfVectorizer(analyzer="char", ngram_range=(2,4),
+                               min_df=3, max_df=1.0, max_features=MAXF_CHAR,
+                               sublinear_tf=True, norm="l2")
+    Xtr_w = word_vec.fit_transform(X_tr); Xva_w = word_vec.transform(X_va)
+    Xtr_c = char_vec.fit_transform(X_tr); Xva_c = char_vec.transform(X_va)
+    XTR = hstack([Xtr_w, Xtr_c]).tocsr()
+    XVA = hstack([Xva_w, Xva_c]).tocsr()
+
+    clf = OneVsRestClassifier(
+        LogisticRegression(solver="saga", penalty="l2", C=C_PARAM,
+                           max_iter=MAX_ITER, class_weight="balanced", n_jobs=-1, verbose=0)
+    )
+    clf.fit(XTR, y_tr)
+    Z_va = clf.decision_function(XVA)              
     Cnum = Z_va.shape[1]
-    A = np.zeros(Cnum, dtype=np.float32); B = np.zeros(Cnum, dtype=np.float32)
+    A = np.zeros(Cnum, dtype=np.float32)
+    B = np.zeros(Cnum, dtype=np.float32)
     for c in range(Cnum):
-        a, b = platt_fit_1d(Z_va[:, c], Y_va[:, c]); A[c], B[c] = a, b
-    np.save(CAL_A_PATH, A); np.save(CAL_B_PATH, B)
-    log(f"    saved Platt params to {CAL_A_PATH}, {CAL_B_PATH}")
-    P_va_cal = platt_apply(Z_va, A, B)
-    log("[5/6] Picking per-class thresholds with precision floors ...")
-    ths = pick_thresholds(Y_va, P_va_cal, default_min_prec=GLOBAL_MIN_PREC, beta=BETA, class_prec_floor=FOCUS)
-    for c in FOCUS.keys():
-        ths = retune_class_threshold_by_f1(Y_va, P_va_cal, ths, c=c, t_min=0.2, t_max=0.95, steps=40)
-    np.save(THS_PATH, ths)
-    log(f"    saved thresholds to {THS_PATH}")
-else:
-    if not (os.path.exists(THS_PATH) and os.path.exists(CAL_A_PATH) and os.path.exists(CAL_B_PATH)):
-        raise FileNotFoundError("Artifacts missing. Run once with LOAD_EXISTING=False.")
-    ths = np.load(THS_PATH); A = np.load(CAL_A_PATH); B = np.load(CAL_B_PATH)
-    log(f"[Loaded] thresholds & Platt params from {SAVE_DIR}")
+        a, b = _platt_fit_1d(Z_va[:,c], y_va[:,c])
+        A[c], B[c] = a, b
+    P_va = _platt_apply(Z_va, A, B)            
 
-log("[6/6] Testing ...")
-Z_te = clf.decision_function(X_te)
-P_te_cal = platt_apply(Z_te, A, B)
-preds = (P_te_cal >= ths).astype(int)
-print("\n[TEST Result]")
-print(classification_report(Y_te, preds, zero_division=0, digits=4))
-mi = f1_score(Y_te, preds, average="micro", zero_division=0)
-ma = precision_recall_fscore_support(Y_te, preds, average="macro", zero_division=0)[2]
-print({"micro_f1": round(mi,4), "macro_f1": round(ma,4)})
+    ths = _pick_thresholds(
+        y_va, P_va,
+        default_min_prec=DEFAULT_PREC_FLOOR,
+        beta=BETA,
+        class_prec_floor=CLASS_PREC_FLOOR
+    )
+    preds = (P_va >= ths).astype(int)
+    print("\n[VALID REPORT]")
+    print(classification_report(y_va, preds, target_names=levels, zero_division=0, digits=4))
+    mi = f1_score(y_va, preds, average="micro", zero_division=0)
+    ma = precision_recall_fscore_support(y_va, preds, average="macro", zero_division=0)[2]
+    print({"micro_f1": round(mi,4), "macro_f1": round(ma,4)})
 
-log(f"\nArtifacts saved in: {os.path.abspath(SAVE_DIR)}")
-for p in (MODEL_PATH, THS_PATH, CAL_A_PATH, CAL_B_PATH):
-    log(f" - {p} ({'exists' if os.path.exists(p) else 'missing'})")
+    with open(MODEL_PATH, "wb") as f:
+        pickle.dump({"word_vec":word_vec, "char_vec":char_vec, "model":clf,
+                     "levels":levels, "text_col":text_col}, f)
+    np.save(A_PATH, A); np.save(B_PATH, B); np.save(THS_PATH, ths)
 
-print(f"\nDone in {int(time.time()-t0)} sec.", flush=True)
+    print("\n 완료 / 저장 위치:", os.path.abspath(SAVE_DIR))
+    print(" -", MODEL_PATH)
+    print(" -", A_PATH)
+    print(" -", B_PATH)
+    print(" -", THS_PATH)
+    print()
+
+if __name__ == "__main__":
+    main()
+
 ```
 
+# 이미지 학습 모델
+
+```python
+import os, time, json, random, warnings, math
+warnings.filterwarnings("ignore")
+
+import numpy as np
+from PIL import Image, ImageFile; ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+import torch, torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms, models
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, accuracy_score
+
+DATA_ROOT = r"C:\python\minidata"
+TRAIN_DIR = os.path.join(DATA_ROOT, "training")  
+TEST_DIR  = os.path.join(DATA_ROOT, "testing")    
+SAVE_DIR  = os.path.join(DATA_ROOT, "final_image_model_torch"); os.makedirs(SAVE_DIR, exist_ok=True)
 
 
-# 웹 페이지
+SEED=42
+IMG=224
+BATCH=16                 
+VAL_SPLIT=0.15
+HEAD_EPOCHS=2            
+FT_EPOCHS=10
+HEAD_LR=3e-4             
+UNFREEZE_BLOCKS=5       
+WD=1e-4                 
+device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+AMP=(device.type=="cuda")
+NUM_WORKERS=0           
+PIN=(device.type=="cuda")
+
+def set_seed(s=SEED):
+    random.seed(s); np.random.seed(s)
+    torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+    torch.backends.cudnn.deterministic=True; torch.backends.cudnn.benchmark=False
+set_seed()
+
+MEAN=(0.485,0.456,0.406); STD=(0.229,0.224,0.225)
+train_tf = transforms.Compose([
+    transforms.RandomResizedCrop(IMG, scale=(0.95,1.0)),  
+    transforms.RandomHorizontalFlip(0.5),
+    transforms.RandomRotation(5, fill=0),
+    transforms.ColorJitter(contrast=0.10),
+    transforms.ToTensor(), transforms.Normalize(MEAN,STD)
+])
+eval_tf  = transforms.Compose([
+    transforms.Resize(int(IMG*1.14)), transforms.CenterCrop(IMG),
+    transforms.ToTensor(), transforms.Normalize(MEAN,STD)
+])
+def build_model(nc:int):
+    m=models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
+    in_f=m.classifier[1].in_features
+    m.classifier=nn.Sequential(nn.BatchNorm1d(in_f), nn.Dropout(0.4), nn.Linear(in_f,nc))
+    return m.to(device)
+
+def unfreeze_last(m, n=UNFREEZE_BLOCKS):
+    for p in m.parameters(): p.requires_grad=False
+    for p in m.classifier.parameters(): p.requires_grad=True
+    for blk in list(m.features.children())[-n:]:
+        for p in blk.parameters(): p.requires_grad=True
+
+def step_print(tag, ep, step, total, t0):
+    if step==1 or step==total or step%(max(1,total//20))==0:
+        dt=time.time()-t0; eta=dt/step*(total-step)
+        print(f"  {tag} E{ep:02d} [{step:>4}/{total:<4}] {dt/step:.2f}s/it ETA {eta/60:.1f}m", flush=True)
+
+def make_criterion(class_weights: torch.Tensor):
+    try:
+        return nn.CrossEntropyLoss(weight=class_weights.to(device), label_smoothing=0.05)
+    except TypeError:
+        return nn.CrossEntropyLoss(weight=class_weights.to(device))
+
+def make_loaders_and_weights(train_root, test_root):
+    probe=datasets.ImageFolder(train_root)
+    idx=np.arange(len(probe.samples)); y_all=np.array([t for _,t in probe.samples])
+    tr,va=train_test_split(idx, test_size=VAL_SPLIT, random_state=SEED, stratify=y_all)
+    cnt=np.bincount(y_all[tr], minlength=len(probe.classes)).astype(np.float32)
+    w=1.0/(cnt+1e-9); w=w/w.sum()*len(w)
+    class_weights=torch.tensor(w, dtype=torch.float32)
+
+    train_ds=Subset(datasets.ImageFolder(train_root, transform=train_tf), tr.tolist())
+    val_ds  =Subset(datasets.ImageFolder(train_root, transform=eval_tf),   va.tolist())
+    test_ds =datasets.ImageFolder(test_root,  transform=eval_tf)
+    tl=DataLoader(train_ds, batch_size=BATCH,   shuffle=True,  num_workers=NUM_WORKERS, pin_memory=PIN, drop_last=False)
+    vl=DataLoader(val_ds,   batch_size=BATCH*2, shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN)
+    tel=DataLoader(test_ds,  batch_size=BATCH*2, shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN)
+    return tl, vl, tel, probe.classes, test_ds, class_weights
+
+def train_epoch(m, dl, crit, opt, scaler, ep, tag, scheduler=None):
+    m.train(); tot=0.0; n=len(dl); t0=time.time()
+    if n==0: print("[WARN] empty loader"); return 0.0
+    for i,(x,y) in enumerate(dl,1):
+        x=x.to(device); y=y.to(device)
+        with torch.cuda.amp.autocast(enabled=AMP):
+            logit=m(x); loss=crit(logit,y)
+        opt.zero_grad(set_to_none=True); scaler.scale(loss).backward()
+        scaler.step(opt); scaler.update()
+        if scheduler is not None: scheduler.step()  
+        tot+=loss.item(); step_print(tag, ep, i, n, t0)
+    return tot/n
+
+@torch.no_grad()
+def eval_metrics(m, dl):
+    m.eval(); ys=[]; ps=[]
+    for x,y in dl:
+        x=x.to(device)
+        with torch.cuda.amp.autocast(enabled=AMP): logit=m(x)
+        ys.append(y.numpy()); ps.append(logit.argmax(1).cpu().numpy())
+    y=np.concatenate(ys); p=np.concatenate(ps)
+    return accuracy_score(y,p), f1_score(y,p,average="macro"), y, p
+
+def save_reports(save_dir, test_ds, acc, f1, y, p):
+    os.makedirs(save_dir, exist_ok=True)
+    rep=classification_report(y,p,target_names=test_ds.classes, digits=4)
+    cm =confusion_matrix(y,p)
+    with open(os.path.join(save_dir,"test_report.txt"),"w",encoding="utf-8") as f:
+        f.write(f"Acc: {acc:.4f} | Macro-F1: {f1:.4f}\n\n"+rep)
+    np.savetxt(os.path.join(save_dir,"confusion_matrix.csv"), cm, fmt="%d", delimiter=",")
+    with open(os.path.join(save_dir,"classes.txt"),"w",encoding="utf-8") as f:
+        for c in test_ds.classes: f.write(c+"\n")
+    print(rep); print(cm)
+def main():
+    print(f"[Device] {device} | CUDA={torch.cuda.is_available()} | mode=single")
+    tl,vl,tel, classes, test_ds, class_weights = make_loaders_and_weights(TRAIN_DIR, TEST_DIR)
+    print(f"[Classes] {classes} | sizes train={len(tl.dataset)} val={len(vl.dataset)} test={len(test_ds)}")
+
+    m=build_model(len(classes))
+    crit=make_criterion(class_weights)
+    scaler=torch.cuda.amp.GradScaler(enabled=AMP)
+
+    for p in m.parameters(): p.requires_grad=False
+    for p in m.classifier.parameters(): p.requires_grad=True
+    opt_head=torch.optim.AdamW(filter(lambda p:p.requires_grad, m.parameters()),
+                               lr=HEAD_LR, weight_decay=WD)
+    print(f"[Head] {HEAD_EPOCHS} epochs, lr={HEAD_LR}")
+    for ep in range(1, HEAD_EPOCHS+1):
+        tr=train_epoch(m, tl, crit, opt_head, scaler, ep, "Head")
+        vacc,vf1,_,_=eval_metrics(m, vl)
+        print(f"    -> val_acc {vacc:.4f} | val_f1 {vf1:.4f}")
+
+    unfreeze_last(m, UNFREEZE_BLOCKS)
+    last_blocks = list(m.features.children())[-UNFREEZE_BLOCKS:]
+    params_head = list(m.classifier.parameters())
+    params_last = [p for blk in last_blocks for p in blk.parameters()]
+    head_ids={id(p) for p in params_head}
+    last_ids={id(p) for p in params_last}
+    params_others = [p for p in m.parameters()
+                     if p.requires_grad and (id(p) not in head_ids) and (id(p) not in last_ids)]
+    print(f"[FT groups] head={len(params_head)} last={len(params_last)} others={len(params_others)}")
+
+    opt = torch.optim.AdamW([
+        {"params": params_head,   "lr": 1e-4},
+        {"params": params_last,   "lr": 3e-5},
+        {"params": params_others, "lr": 1e-5},
+    ], weight_decay=WD)
+
+    total_steps  = FT_EPOCHS * max(1, len(tl))
+    warmup_steps = max(1, 3 * len(tl))
+    def lr_lambda(step):
+        if step < warmup_steps: return step / warmup_steps
+        p = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1 + math.cos(math.pi * p))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
+
+    best_acc=-1.0
+    area_dir=os.path.join(SAVE_DIR, "all"); os.makedirs(area_dir, exist_ok=True)
+    best_path=os.path.join(area_dir, "best_full.pt")
+
+    print(f"[FT] {FT_EPOCHS} epochs, lr(head=1e-4,last=3e-5,others=1e-5), unfreeze last {UNFREEZE_BLOCKS}")
+    for ep in range(1, FT_EPOCHS+1):
+        tr=train_epoch(m, tl, crit, opt, scaler, ep, "FT", scheduler)
+        vacc,vf1,_,_=eval_metrics(m, vl)
+        print(f"    -> val_acc {vacc:.4f} | val_f1 {vf1:.4f}")
+        if vacc>best_acc:
+            best_acc=vacc; torch.save(m.state_dict(), best_path)
+
+    m.load_state_dict(torch.load(best_path, map_location=device))
+    acc,f1,y,p=eval_metrics(m, tel)
+    print("\n[TEST] Acc {:.4f} | Macro-F1 {:.4f}".format(acc, f1))
+    save_reports(area_dir, test_ds, acc, f1, y, p)
+    with open(os.path.join(area_dir,"train_summary.json"),"w",encoding="utf-8") as f:
+        json.dump({"best_val_acc":float(best_acc), "test_acc":float(acc), "test_macro_f1":float(f1)}, f, ensure_ascii=False, indent=2)
+    print(f"[SAVED] {best_path}")
+
+if __name__=="__main__":
+    main()
+
+```
+
+#  웹 페이지
 
 ```python
 import os, pickle, numpy as np
